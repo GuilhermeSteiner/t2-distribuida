@@ -8,7 +8,7 @@ O programa procura um termo em vários arquivos de log usando C e MPI. Cada arqu
 - Gabriel Mengato Chiarelli de Souza Scalon
 - Margot Machado Baisch
 
-O [relatório técnico](relatorio_tecnico_t2.docx) apresenta a implementação e os resultados da avaliação local.
+O [relatório técnico](relatorio.docx) apresenta a implementação e os resultados da avaliação local.
 
 ## 1. Preparar o ambiente e compilar
 
