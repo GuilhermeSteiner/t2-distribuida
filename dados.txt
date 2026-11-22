@@ -1,3 +1,0 @@
-Preencher nesse .txt todos os dados obtidos e solicitados
-
-Depois de coletar tudo, transferir para um .docx e transformar em pdf
