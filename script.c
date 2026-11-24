@@ -1,4 +1,5 @@
 #define _POSIX_C_SOURCE 200809L
+#define _FILE_OFFSET_BITS 64
 
 #include <dirent.h>
 #include <errno.h>
@@ -9,14 +10,17 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/types.h>
 
-enum { TAG_QUANTIDADE, TAG_TAREFA, TAG_RESULTADO, TAG_TEXTO };
+enum { TAG_QUANTIDADE, TAG_TAREFA, TAG_INICIO, TAG_RESULTADO, TAG_TEXTO };
+enum { BLOCO_TEXTO = 64 * 1024 };
 
 typedef struct {
     char *nome;
     unsigned long long ocorrencias;
-    char *texto;
-    size_t tamanho;
+    unsigned long long tamanho;
+    off_t posicao;
+    int worker;
 } Arquivo;
 
 typedef struct {
@@ -24,11 +28,37 @@ typedef struct {
     char *nome;
 } Tarefa;
 
-static void falhar(const char *contexto)
+typedef struct {
+    const char *diretorio;
+    const char *termo;
+    int estatico;
+} Opcoes;
+
+static _Noreturn void falhar(const char *contexto)
 {
     perror(contexto);
     MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
-    exit(EXIT_FAILURE);
+    _Exit(EXIT_FAILURE);
+}
+
+static _Noreturn void falhar_protocolo(const char *contexto)
+{
+    errno = EPROTO;
+    falhar(contexto);
+}
+
+static FILE *abrir_temporario(void)
+{
+    FILE *arquivo = tmpfile();
+    if (arquivo == NULL) {
+        falhar("Arquivo temporario de resultados");
+    }
+    return arquivo;
+}
+
+static size_t tamanho_bloco(unsigned long long restante)
+{
+    return restante > BLOCO_TEXTO ? BLOCO_TEXTO : (size_t)restante;
 }
 
 static void *realocar(void *ponteiro, size_t tamanho)
@@ -99,12 +129,24 @@ static Arquivo *listar_arquivos(const char *diretorio, int *total)
     return arquivos;
 }
 
-static void enviar_tarefa(int worker, int indice, const char *nome)
+static void enviar_tarefa(int worker, int indice, Arquivo *arquivo, int sincronizar_nome)
 {
+    if (indice < 0) {
+        MPI_Send(&indice, 1, MPI_INT, worker, TAG_TAREFA, MPI_COMM_WORLD);
+        return;
+    }
+    size_t comprimento = strlen(arquivo->nome);
+    if (comprimento >= (size_t)INT_MAX) {
+        errno = EOVERFLOW;
+        falhar("Nome do arquivo excede o limite da mensagem MPI");
+    }
+    int tamanho = (int)(comprimento + 1);
+    arquivo->worker = worker;
     MPI_Send(&indice, 1, MPI_INT, worker, TAG_TAREFA, MPI_COMM_WORLD);
-    if (indice >= 0) {
-        MPI_Send(nome, (int)strlen(nome) + 1, MPI_CHAR, worker, TAG_TAREFA,
-                 MPI_COMM_WORLD);
+    if (sincronizar_nome) {
+        MPI_Ssend(arquivo->nome, tamanho, MPI_CHAR, worker, TAG_TAREFA, MPI_COMM_WORLD);
+    } else {
+        MPI_Send(arquivo->nome, tamanho, MPI_CHAR, worker, TAG_TAREFA, MPI_COMM_WORLD);
     }
 }
 
@@ -118,9 +160,15 @@ static Tarefa receber_tarefa(void)
         int tamanho;
         MPI_Probe(0, TAG_TAREFA, MPI_COMM_WORLD, &status);
         MPI_Get_count(&status, MPI_CHAR, &tamanho);
+        if (tamanho <= 0) {
+            falhar_protocolo("Tamanho invalido do nome da tarefa");
+        }
         tarefa.nome = realocar(NULL, (size_t)tamanho);
         MPI_Recv(tarefa.nome, tamanho, MPI_CHAR, 0, TAG_TAREFA, MPI_COMM_WORLD,
                  MPI_STATUS_IGNORE);
+        if (tarefa.nome[0] == '\0' || tarefa.nome[tamanho - 1] != '\0') {
+            falhar_protocolo("Nome invalido da tarefa");
+        }
     }
     return tarefa;
 }
@@ -135,13 +183,7 @@ static void processar_tarefa(Tarefa tarefa, const char *diretorio, const char *t
         falhar(caminho);
     }
 
-    char *texto = NULL;
-    size_t tamanho_texto = 0;
-    FILE *resultado = open_memstream(&texto, &tamanho_texto);
-    if (resultado == NULL) {
-        falhar("Buffer de resultados");
-    }
-
+    FILE *resultado = NULL;
     char *linha = NULL;
     size_t capacidade = 0;
     ssize_t tamanho_linha;
@@ -156,8 +198,11 @@ static void processar_tarefa(Tarefa tarefa, const char *diretorio, const char *t
             }
         }
         if (strstr(linha, termo) != NULL) {
+            if (resultado == NULL) {
+                resultado = abrir_temporario();
+            }
             if (fprintf(resultado, "%s:%llu: %s\n", tarefa.nome, numero, linha) < 0) {
-                falhar("Buffer de resultados");
+                falhar("Gravacao do resultado do worker");
             }
             ++ocorrencias;
         }
@@ -169,131 +214,176 @@ static void processar_tarefa(Tarefa tarefa, const char *diretorio, const char *t
     if (fclose(log) != 0) {
         falhar(caminho);
     }
-    if (fclose(resultado) != 0) {
-        falhar("Buffer de resultados");
-    }
     free(linha);
     free(caminho);
     free(tarefa.nome);
 
+    unsigned long long tamanho_texto = 0;
+    if (resultado != NULL) {
+        off_t tamanho = ftello(resultado);
+        if (tamanho < 0 || fseeko(resultado, 0, SEEK_SET) != 0) {
+            falhar("Posicionamento no resultado do worker");
+        }
+        tamanho_texto = (unsigned long long)tamanho;
+    }
     unsigned long long dados[] = { (unsigned long long)tarefa.indice,
                                    ocorrencias, tamanho_texto };
     MPI_Send(dados, 3, MPI_UNSIGNED_LONG_LONG, 0, TAG_RESULTADO, MPI_COMM_WORLD);
 
-    for (size_t inicio = 0; inicio < tamanho_texto;) {
-        size_t restante = tamanho_texto - inicio;
-        int bloco = restante > INT_MAX ? INT_MAX : (int)restante;
-        MPI_Send(texto + inicio, bloco, MPI_CHAR, 0, TAG_TEXTO, MPI_COMM_WORLD);
-        inicio += (size_t)bloco;
+    char texto[BLOCO_TEXTO];
+    for (unsigned long long restante = tamanho_texto; restante > 0;) {
+        size_t bloco = tamanho_bloco(restante);
+        if (fread(texto, 1, bloco, resultado) != bloco) {
+            falhar("Leitura do resultado do worker");
+        }
+        MPI_Send(texto, (int)bloco, MPI_CHAR, 0, TAG_TEXTO, MPI_COMM_WORLD);
+        restante -= bloco;
     }
-    free(texto);
+    if (resultado != NULL && fclose(resultado) != 0) {
+        falhar("Fechamento do resultado do worker");
+    }
 }
 
-static int receber_resultado(Arquivo *arquivos)
+static int receber_resultado(Arquivo *arquivos, int total, FILE **temporario)
 {
     unsigned long long dados[3];
     MPI_Status status;
     MPI_Recv(dados, 3, MPI_UNSIGNED_LONG_LONG, MPI_ANY_SOURCE, TAG_RESULTADO,
              MPI_COMM_WORLD, &status);
-
+    int quantidade;
+    MPI_Get_count(&status, MPI_UNSIGNED_LONG_LONG, &quantidade);
+    if (quantidade != 3 || dados[0] >= (unsigned long long)total
+        || (dados[1] == 0) != (dados[2] == 0)) {
+        falhar_protocolo("Cabecalho de resultado invalido");
+    }
     int worker = status.MPI_SOURCE;
     Arquivo *arquivo = &arquivos[dados[0]];
+    if (arquivo->worker != worker || worker == 0) {
+        falhar_protocolo("Resultado de worker inesperado ou duplicado");
+    }
     arquivo->ocorrencias = dados[1];
-    arquivo->tamanho = (size_t)dados[2];
+    arquivo->tamanho = dados[2];
     if (arquivo->tamanho > 0) {
-        arquivo->texto = realocar(NULL, arquivo->tamanho);
+        if (*temporario == NULL) {
+            *temporario = abrir_temporario();
+        }
+        arquivo->posicao = ftello(*temporario);
+        if (arquivo->posicao < 0) {
+            falhar("Posicao do resultado no coordenador");
+        }
     }
-    for (size_t inicio = 0; inicio < arquivo->tamanho;) {
-        size_t restante = arquivo->tamanho - inicio;
-        int bloco = restante > INT_MAX ? INT_MAX : (int)restante;
-        MPI_Recv(arquivo->texto + inicio, bloco, MPI_CHAR, worker, TAG_TEXTO,
-                 MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-        inicio += (size_t)bloco;
+    char texto[BLOCO_TEXTO];
+    for (unsigned long long restante = arquivo->tamanho; restante > 0;) {
+        size_t bloco = tamanho_bloco(restante);
+        MPI_Recv(texto, (int)bloco, MPI_CHAR, worker, TAG_TEXTO, MPI_COMM_WORLD, &status);
+        MPI_Get_count(&status, MPI_CHAR, &quantidade);
+        if (quantidade != (int)bloco) {
+            falhar_protocolo("Tamanho invalido do bloco de resultado");
+        }
+        if (fwrite(texto, 1, bloco, *temporario) != bloco) {
+            falhar("Gravacao do resultado no coordenador");
+        }
+        restante -= bloco;
     }
+    arquivo->worker = 0;
     return worker;
 }
 
 static void executar_estatico(Arquivo *arquivos, int total, int rank, int processos,
-                              const char *diretorio, const char *termo)
+                              const Opcoes *opcoes, FILE **temporario)
 {
-    Tarefa *tarefas = NULL;
-    int quantidade = 0;
     if (rank == 0) {
         int workers = processos - 1;
         int indice = 0;
         for (int worker = 1; worker < processos; ++worker) {
-            quantidade = total / workers + (worker <= total % workers);
+            int quantidade = total / workers + (worker <= total % workers);
             MPI_Send(&quantidade, 1, MPI_INT, worker, TAG_QUANTIDADE, MPI_COMM_WORLD);
             for (int i = 0; i < quantidade; ++i, ++indice) {
-                enviar_tarefa(worker, indice, arquivos[indice].nome);
+                enviar_tarefa(worker, indice, &arquivos[indice], i == quantidade - 1);
             }
         }
-    } else {
-        MPI_Recv(&quantidade, 1, MPI_INT, 0, TAG_QUANTIDADE, MPI_COMM_WORLD,
-                 MPI_STATUS_IGNORE);
-        if (quantidade > 0) {
-            tarefas = realocar(NULL, (size_t)quantidade * sizeof(*tarefas));
+        for (int worker = 1; worker < processos && worker <= total; ++worker) {
+            MPI_Send(NULL, 0, MPI_BYTE, worker, TAG_INICIO, MPI_COMM_WORLD);
         }
-        for (int i = 0; i < quantidade; ++i) {
-            tarefas[i] = receber_tarefa();
+        for (int i = 0; i < total; ++i) {
+            receber_resultado(arquivos, total, temporario);
         }
+        return;
     }
 
-    MPI_Barrier(MPI_COMM_WORLD);
-    if (rank == 0) {
-        for (int i = 0; i < total; ++i) {
-            receber_resultado(arquivos);
-        }
-    } else {
-        for (int i = 0; i < quantidade; ++i) {
-            processar_tarefa(tarefas[i], diretorio, termo);
-        }
-        free(tarefas);
+    int quantidade;
+    MPI_Recv(&quantidade, 1, MPI_INT, 0, TAG_QUANTIDADE, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+    if (quantidade == 0) {
+        return;
     }
+    Tarefa *tarefas = realocar(NULL, (size_t)quantidade * sizeof(*tarefas));
+    for (int i = 0; i < quantidade; ++i) {
+        tarefas[i] = receber_tarefa();
+        if (tarefas[i].indice < 0) {
+            falhar_protocolo("Tarefa invalida no modo estatico");
+        }
+    }
+    MPI_Recv(NULL, 0, MPI_BYTE, 0, TAG_INICIO, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+    for (int i = 0; i < quantidade; ++i) {
+        processar_tarefa(tarefas[i], opcoes->diretorio, opcoes->termo);
+    }
+    free(tarefas);
 }
 
 static void executar_dinamico(Arquivo *arquivos, int total, int rank, int processos,
-                              const char *diretorio, const char *termo)
+                              const Opcoes *opcoes, FILE **temporario)
 {
     if (rank == 0) {
         int proximo = 0;
         for (int worker = 1; worker < processos; ++worker) {
             if (proximo < total) {
-                enviar_tarefa(worker, proximo, arquivos[proximo].nome);
+                enviar_tarefa(worker, proximo, &arquivos[proximo], 0);
                 ++proximo;
             } else {
-                enviar_tarefa(worker, -1, NULL);
+                enviar_tarefa(worker, -1, NULL, 0);
             }
         }
 
         for (int i = 0; i < total; ++i) {
-            int worker = receber_resultado(arquivos);
+            int worker = receber_resultado(arquivos, total, temporario);
             if (proximo < total) {
-                enviar_tarefa(worker, proximo, arquivos[proximo].nome);
+                enviar_tarefa(worker, proximo, &arquivos[proximo], 0);
                 ++proximo;
             } else {
-                enviar_tarefa(worker, -1, NULL);
+                enviar_tarefa(worker, -1, NULL, 0);
             }
         }
     } else {
         Tarefa tarefa = receber_tarefa();
         while (tarefa.indice >= 0) {
-            processar_tarefa(tarefa, diretorio, termo);
+            processar_tarefa(tarefa, opcoes->diretorio, opcoes->termo);
             tarefa = receber_tarefa();
         }
     }
 }
 
-static void apresentar_resultados(Arquivo *arquivos, int total, double tempo)
+static void apresentar_resultados(Arquivo *arquivos, int total, FILE *temporario,
+                                  double tempo)
 {
     unsigned long long ocorrencias = 0;
+    char texto[BLOCO_TEXTO];
     puts("=== RESULTADOS DA BUSCA ===");
     for (int i = 0; i < total; ++i) {
-        if (arquivos[i].tamanho > 0) {
-            fwrite(arquivos[i].texto, 1, arquivos[i].tamanho, stdout);
+        unsigned long long restante = arquivos[i].tamanho;
+        if (restante > 0 && fseeko(temporario, arquivos[i].posicao, SEEK_SET) != 0) {
+            falhar("Posicionamento no resultado do coordenador");
+        }
+        while (restante > 0) {
+            size_t bloco = tamanho_bloco(restante);
+            if (fread(texto, 1, bloco, temporario) != bloco) {
+                falhar("Leitura do resultado no coordenador");
+            }
+            if (fwrite(texto, 1, bloco, stdout) != bloco) {
+                falhar("Escrita da saida");
+            }
+            restante -= bloco;
         }
         ocorrencias += arquivos[i].ocorrencias;
-        free(arquivos[i].texto);
     }
 
     puts("\n=== RESUMO ===");
@@ -304,7 +394,64 @@ static void apresentar_resultados(Arquivo *arquivos, int total, double tempo)
         free(arquivos[i].nome);
     }
     printf("\nTempo de execucao: %.6f segundos\n", tempo);
+    if (fflush(stdout) != 0 || ferror(stdout)) {
+        falhar("Escrita da saida");
+    }
+    if (temporario != NULL && fclose(temporario) != 0) {
+        falhar("Fechamento do resultado no coordenador");
+    }
     free(arquivos);
+}
+
+static int erro_opcao(int rank, const char *mensagem, const char *opcao)
+{
+    if (rank == 0) {
+        fprintf(stderr, "%s: %s\n", mensagem, opcao);
+    }
+    return 0;
+}
+
+static int ler_opcoes(int argc, char **argv, int rank, Opcoes *opcoes)
+{
+    enum { OP_DIRETORIO, OP_TERMO, OP_MODO, TOTAL_OPCOES };
+    const char *nomes[TOTAL_OPCOES] = { "--dir", "--search", "--mode" };
+    const char *valores[TOTAL_OPCOES] = {0};
+
+    for (int i = 1; i < argc; ++i) {
+        const char *igual = strchr(argv[i], '=');
+        size_t tamanho = igual == NULL ? strlen(argv[i]) : (size_t)(igual - argv[i]);
+        int opcao = 0;
+        while (opcao < TOTAL_OPCOES
+               && (strlen(nomes[opcao]) != tamanho || strncmp(argv[i], nomes[opcao], tamanho) != 0)) {
+            ++opcao;
+        }
+        if (opcao == TOTAL_OPCOES) {
+            return erro_opcao(rank, "Opcao desconhecida", argv[i]);
+        }
+        if (valores[opcao] != NULL) {
+            return erro_opcao(rank, "Opcao repetida", nomes[opcao]);
+        }
+        if (igual == NULL && (i + 1 == argc || strncmp(argv[i + 1], "--", 2) == 0)) {
+            return erro_opcao(rank, "Falta valor para a opcao", nomes[opcao]);
+        }
+        valores[opcao] = igual == NULL ? argv[++i] : igual + 1;
+        if (valores[opcao][0] == '\0') {
+            return erro_opcao(rank, "Valor vazio para a opcao", nomes[opcao]);
+        }
+    }
+
+    for (int i = 0; i < TOTAL_OPCOES; ++i) {
+        if (valores[i] == NULL) {
+            return erro_opcao(rank, "Falta a opcao obrigatoria", nomes[i]);
+        }
+    }
+    opcoes->diretorio = valores[OP_DIRETORIO];
+    opcoes->termo = valores[OP_TERMO];
+    opcoes->estatico = strcmp(valores[OP_MODO], "static") == 0;
+    if (!opcoes->estatico && strcmp(valores[OP_MODO], "dynamic") != 0) {
+        return erro_opcao(rank, "Modo invalido", valores[OP_MODO]);
+    }
+    return 1;
 }
 
 int main(int argc, char **argv)
@@ -314,48 +461,37 @@ int main(int argc, char **argv)
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &processos);
 
-    const char *diretorio = NULL;
-    const char *termo = NULL;
-    const char *modo = NULL;
-    if (argc == 7) {
-        for (int i = 1; i < argc; i += 2) {
-            if (strcmp(argv[i], "--dir") == 0) {
-                diretorio = argv[i + 1];
-            } else if (strcmp(argv[i], "--search") == 0) {
-                termo = argv[i + 1];
-            } else if (strcmp(argv[i], "--mode") == 0) {
-                modo = argv[i + 1];
-            }
-        }
-    }
-
-    if (diretorio == NULL || diretorio[0] == '\0' || termo == NULL || termo[0] == '\0'
-        || modo == NULL || (strcmp(modo, "static") != 0 && strcmp(modo, "dynamic") != 0)
-        || processos < 2) {
+    Opcoes opcoes;
+    if (!ler_opcoes(argc, argv, rank, &opcoes) || processos < 2) {
         if (rank == 0) {
             fprintf(stderr,
                     "Uso: mpirun -np <2 ou mais> %s --dir <diretorio> "
-                    "--search <termo> --mode <static|dynamic>\n", argv[0]);
+                    "--search <termo> --mode <static|dynamic>\n"
+                    "Tambem aceita --opcao=valor.\n", argv[0]);
         }
         MPI_Finalize();
         return EXIT_FAILURE;
     }
 
     Arquivo *arquivos = NULL;
+    FILE *temporario = NULL;
     int total = 0;
     double inicio = 0.0;
     if (rank == 0) {
+        arquivos = listar_arquivos(opcoes.diretorio, &total);
         inicio = MPI_Wtime();
-        arquivos = listar_arquivos(diretorio, &total);
     }
-    if (strcmp(modo, "static") == 0) {
-        executar_estatico(arquivos, total, rank, processos, diretorio, termo);
+    if (opcoes.estatico) {
+        executar_estatico(arquivos, total, rank, processos, &opcoes, &temporario);
     } else {
-        executar_dinamico(arquivos, total, rank, processos, diretorio, termo);
+        executar_dinamico(arquivos, total, rank, processos, &opcoes, &temporario);
     }
     if (rank == 0) {
+        if (temporario != NULL && fflush(temporario) != 0) {
+            falhar("Gravacao do resultado consolidado");
+        }
         double tempo = MPI_Wtime() - inicio;
-        apresentar_resultados(arquivos, total, tempo);
+        apresentar_resultados(arquivos, total, temporario, tempo);
     }
 
     MPI_Finalize();

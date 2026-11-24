@@ -62,7 +62,13 @@ mpirun -np 3 ./busca_logs --dir logs_exemplo --search ERROR --mode dynamic
 
 `-np 3` inicia um coordenador e dois workers. Para usar outros logs, informe o diretório em `--dir`. Troque `ERROR` pelo trecho desejado em `--search`. A busca diferencia maiúsculas de minúsculas. Use aspas se o trecho contiver espaços, como `--search "disco cheio"`.
 
+Também é possível escrever as opções com `=`, por exemplo `--dir=logs_exemplo --search="disco cheio" --mode=dynamic`. Use essa forma se um valor começar com `--`.
+
+O modo estático divide a lista ordenada em blocos fixos e libera a busca após distribuir todos os blocos. No dinâmico, cada worker recebe outra tarefa à medida que devolve o resultado anterior.
+
 A saída lista as correspondências no formato `arquivo:linha: conteúdo` e mostra as contagens por arquivo e o total, além do tempo de execução. Em `logs_exemplo`, os dois modos encontram duas linhas, uma de cada arquivo.
+
+O tempo exibido cobre a distribuição, a leitura dos logs, a busca e a coleta dos resultados em arquivos temporários. A listagem inicial e a impressão ficam fora dessa medição.
 
 Para salvar as saídas em arquivos, use `>` e mantenha os arquivos de saída fora da pasta dos logs.
 
