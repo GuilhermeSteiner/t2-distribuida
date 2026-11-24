@@ -1,4 +1,4 @@
-# Busca distribuída em arquivos de log
+# T2 - Busca distribuída em arquivos de log
 
 **Integrantes**
 
@@ -38,7 +38,7 @@ Use uma pasta com os arquivos de log em texto.
 mkdir logs
 ```
 
-### Gerador de logs do enunciado
+### Gerador de logs
 
 Para gerar logs sintéticos, baixe o [gerador_logs_t2.c](https://drive.google.com/file/d/1iWlRKR_4mHfbNhGBOrlP9FlXwlG6yCyW/view?usp=sharing) disponibilizado pelo professor na seção **Entrada** do enunciado do Trabalho 2 (p. 2). Na pasta onde salvou o arquivo, rode o exemplo do enunciado (p. 3).
 
@@ -47,7 +47,7 @@ gcc -O2 gerador_logs_t2.c -o gerador_logs_t2
 ./gerador_logs_t2 100 10000 8 42 logs
 ```
 
-O comando gera na pasta `logs` 100 arquivos com 10.000 linhas cada, oito palavras de mensagem por linha e semente `42`. Para buscar nesses arquivos, substitua `--dir logs` por `--dir logs` ou informe o caminho até a pasta de logs gerada.
+O comando gera na pasta `logs` 100 arquivos com 10.000 linhas cada, oito palavras de mensagem por linha e semente `42`. Para buscar nesses arquivos, substitua `--dir logs` por um caminho até a pasta de logs gerada.
 
 ## Execução
 
